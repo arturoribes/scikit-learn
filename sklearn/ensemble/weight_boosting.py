@@ -42,6 +42,7 @@ from ..utils.extmath import stable_cumsum
 from ..metrics import accuracy_score, r2_score
 from sklearn.utils.validation import has_fit_parameter, check_is_fitted
 
+
 __all__ = [
     'AdaBoostClassifier',
     'AdaBoostRegressor',
@@ -322,18 +323,26 @@ class AdaBoostClassifier(BaseWeightBoosting, ClassifierMixin):
         ``learning_rate``. There is a trade-off between ``learning_rate`` and
         ``n_estimators``.
 
-    algorithm : {'SAMME', 'SAMME.R'}, optional (default='SAMME.R')
+    algorithm : {'SAMME', 'SAMME.R', 'M2'}, optional (default='SAMME.R')
         If 'SAMME.R' then use the SAMME.R real boosting algorithm.
         ``base_estimator`` must support calculation of class probabilities.
         If 'SAMME' then use the SAMME discrete boosting algorithm.
         The SAMME.R algorithm typically converges faster than SAMME,
         achieving a lower test error with fewer boosting iterations.
+        If 'M2' then use the M2 boosting algorithm
 
     random_state : int, RandomState instance or None, optional (default=None)
         If int, random_state is the seed used by the random number generator;
         If RandomState instance, random_state is the random number generator;
         If None, the random number generator is the RandomState instance used
         by `np.random`.
+
+    balance : float or array[float], optional (default=None)
+        If used, random undersampling (RUS) will be applied in each boosting
+        round before training the estimator. It can be a single float,
+        indicating the proportion of all classes with the minority class, or
+        an array of floats, indicating the proportion of each class with the
+        minority class.
 
     Attributes
     ----------
@@ -373,7 +382,8 @@ class AdaBoostClassifier(BaseWeightBoosting, ClassifierMixin):
                  n_estimators=50,
                  learning_rate=1.,
                  algorithm='SAMME.R',
-                 random_state=None):
+                 random_state=None,
+                 balance=None):
 
         super(AdaBoostClassifier, self).__init__(
             base_estimator=base_estimator,
@@ -382,6 +392,46 @@ class AdaBoostClassifier(BaseWeightBoosting, ClassifierMixin):
             random_state=random_state)
 
         self.algorithm = algorithm
+        self.balance = balance
+
+    def undersampling(self, Y, weights):
+        '''Check the minor class'''
+        classes = np.unique(Y)
+        numSamplesPerClass = np.bincount(Y)
+        if isinstance(self.balance, list):
+            numTargetSamples = numSamplesPerClass.min()*self.balance
+        else:
+            numTargetSamples = numSamplesPerClass.min() \
+                               * self.balance * np.ones((len(classes), 1))
+
+        numTargetSamples = numTargetSamples.astype(np.int32)
+        sampledIndices = np.array([])
+
+        for i in np.arange(len(classes)):
+            classIndices = np.where(Y == classes[i])[0]
+
+            if numSamplesPerClass[i] == numTargetSamples[i]:
+                sampledIndices = np.append(sampledIndices, classIndices)
+            else:
+                w = weights[classIndices]
+                w[w < np.finfo(w.dtype).eps] = np.finfo(w.dtype).eps
+                w = w/sum(w)
+                if numSamplesPerClass[i] > numTargetSamples[i]:
+                    sampledIndices = np.append(sampledIndices,
+                                               np.random.choice(
+                                                classIndices,
+                                                numTargetSamples[i],
+                                                replace=True,
+                                                p=w))
+                else:
+                    sampledIndices = np.append(sampledIndices,
+                                               np.random.choice(
+                                                classIndices,
+                                                numTargetSamples[i],
+                                                replace=False,
+                                                p=w))
+
+        return sampledIndices.astype(np.int32)
 
     def fit(self, X, y, sample_weight=None):
         """Build a boosted classifier from the training set (X, y).
@@ -405,8 +455,21 @@ class AdaBoostClassifier(BaseWeightBoosting, ClassifierMixin):
             Returns self.
         """
         # Check that algorithm is supported
-        if self.algorithm not in ('SAMME', 'SAMME.R'):
+        if self.algorithm not in ('SAMME', 'SAMME.R', 'M2'):
             raise ValueError("algorithm %s is not supported" % self.algorithm)
+
+        if self.algorithm == 'M2':
+            # Initialize algorithm
+            classes = np.unique(y)
+
+            # Mask used to compute per-class margin
+            self.negClassMask = np.ones((len(y), len(classes)), dtype=bool)
+            self.negClassMask[np.arange(0, self.negClassMask.shape[0]), y] = 0
+
+            # Store weights for false hypotheses
+            self.falseW = np.ones((len(y), len(classes)))/len(y)
+            self.falseW[np.arange(0, self.falseW.shape[0]), y] = 0
+            self.falseW = self.falseW/self.falseW.sum()
 
         # Fit
         return super(AdaBoostClassifier, self).fit(X, y, sample_weight)
@@ -416,13 +479,13 @@ class AdaBoostClassifier(BaseWeightBoosting, ClassifierMixin):
         super(AdaBoostClassifier, self)._validate_estimator(
             default=DecisionTreeClassifier(max_depth=1))
 
-        #  SAMME-R requires predict_proba-enabled base estimators
-        if self.algorithm == 'SAMME.R':
+        #  SAMME-R and M2 requires predict_proba-enabled base estimators
+        if self.algorithm in ('SAMME.R', 'M2'):
             if not hasattr(self.base_estimator_, 'predict_proba'):
                 raise TypeError(
-                    "AdaBoostClassifier with algorithm='SAMME.R' requires "
-                    "that the weak learner supports the calculation of class "
-                    "probabilities with a predict_proba method.\n"
+                    "AdaBoostClassifier with algorithm='SAMME.R or M2' "
+                    "require that the weak learner supports the calculation "
+                    "of class probabilities with a predict_proba method.\n"
                     "Please change the base estimator or set "
                     "algorithm='SAMME' instead.")
         if not has_fit_parameter(self.base_estimator_, "sample_weight"):
@@ -470,16 +533,75 @@ class AdaBoostClassifier(BaseWeightBoosting, ClassifierMixin):
         """
         if self.algorithm == 'SAMME.R':
             return self._boost_real(iboost, X, y, sample_weight, random_state)
-
+        elif self.algorithm == "M2":
+            return self._boost_m2(iboost, X, y, sample_weight, random_state)
         else:  # elif self.algorithm == "SAMME":
             return self._boost_discrete(iboost, X, y, sample_weight,
                                         random_state)
+
+    def _boost_m2(self, iboost, X, y, sample_weight, random_state):
+        """Implement a single boost using the AdaBoost.M2 algorithm."""
+        estimator = self._make_estimator(random_state=random_state)
+
+        # Sample dataset and fit estimator
+        idx = self.undersampling(y, sample_weight)
+        estimator.fit(X[idx, :], y[idx])
+
+        # Get margin per class, that is, score for true class
+        # minus scores for this class.
+        # For the true class, the margin is the score for the true class
+        scores = estimator.predict_proba(X)
+        mar = scores[np.arange(0, scores.shape[0]), y, np.newaxis] \
+            - scores * self.negClassMask
+
+        if iboost == 0:
+            self.classes_ = getattr(estimator, 'classes_', None)
+            self.n_classes_ = len(self.classes_)
+
+        # FalseW contains weights for false labels, and zero for true labels.
+        # Make sure it is properly normalized
+        falseWperObs = self.falseW.sum(axis=1)
+        useObs = np.logical_and(sample_weight > 0, falseWperObs)
+        if not np.any(useObs):
+            raise ValueError(
+                "All false weights are zero.")
+
+        self.falseW[useObs, :] = self.falseW[useObs, :] \
+            * ((sample_weight[useObs, np.newaxis] /
+               sample_weight[useObs, np.newaxis].sum()) /
+               falseWperObs[useObs, np.newaxis])
+        self.falseW[np.logical_not(useObs), :] = 0
+
+        # Get pseudo-loss
+        loss = 0.5*(self.falseW*(1-mar)).sum()
+
+        # Compute estimator weight
+        beta = loss if loss < 0.5 else 0.5
+        estimator_weight = 0.5*self.learning_rate*np.log((1-beta)/beta)
+
+        # Update weights
+        beta = np.power(loss/(1-loss), self.learning_rate)
+        self.falseW = self.falseW*np.power(beta, (1+mar)/2)
+
+        # Get new weights for data generation. Sum of weights remains constant
+        Wnew = self.falseW.sum(axis=1)
+        sample_weight = Wnew * sample_weight.sum() / Wnew.sum()
+
+        # Stop if classification is perfect
+        if loss <= 0:
+            return sample_weight, estimator_weight, 0.
+
+        return sample_weight, estimator_weight, loss
 
     def _boost_real(self, iboost, X, y, sample_weight, random_state):
         """Implement a single boost using the SAMME.R real algorithm."""
         estimator = self._make_estimator(random_state=random_state)
 
-        estimator.fit(X, y, sample_weight=sample_weight)
+        if self.balance > 0.0:
+            idx = self.undersampling(y, sample_weight)
+            estimator.fit(X[idx], y[idx])
+        else:
+            estimator.fit(X, y, sample_weight=sample_weight)
 
         y_predict_proba = estimator.predict_proba(X)
 
@@ -667,6 +789,10 @@ class AdaBoostClassifier(BaseWeightBoosting, ClassifierMixin):
             # The weights are all 1. for SAMME.R
             pred = sum(_samme_proba(estimator, n_classes, X)
                        for estimator in self.estimators_)
+        elif self.algorithm == 'M2':
+            pred = sum(estimator.predict_proba(X) * w
+                       for estimator, w in zip(self.estimators_,
+                                               self.estimator_weights_))
         else:   # self.algorithm == "SAMME"
             pred = sum((estimator.predict(X) == classes).T * w
                        for estimator, w in zip(self.estimators_,
@@ -676,6 +802,7 @@ class AdaBoostClassifier(BaseWeightBoosting, ClassifierMixin):
         if n_classes == 2:
             pred[:, 0] *= -1
             return pred.sum(axis=1)
+
         return pred
 
     def staged_decision_function(self, X):
@@ -715,6 +842,8 @@ class AdaBoostClassifier(BaseWeightBoosting, ClassifierMixin):
             if self.algorithm == 'SAMME.R':
                 # The weights are all 1. for SAMME.R
                 current_pred = _samme_proba(estimator, n_classes, X)
+            elif self.algorithm == 'M2':
+                current_pred = estimator.predict_proba(X) * weight
             else:  # elif self.algorithm == "SAMME":
                 current_pred = estimator.predict(X)
                 current_pred = (current_pred == classes).T * weight
@@ -755,17 +884,23 @@ class AdaBoostClassifier(BaseWeightBoosting, ClassifierMixin):
         n_classes = self.n_classes_
         X = self._validate_X_predict(X)
 
-        if self.algorithm == 'SAMME.R':
-            # The weights are all 1. for SAMME.R
-            proba = sum(_samme_proba(estimator, n_classes, X)
-                        for estimator in self.estimators_)
-        else:   # self.algorithm == "SAMME"
+        if self.algorithm == 'M2':
             proba = sum(estimator.predict_proba(X) * w
                         for estimator, w in zip(self.estimators_,
                                                 self.estimator_weights_))
+        else:
+            if self.algorithm == 'SAMME.R':
+                # The weights are all 1. for SAMME.R
+                proba = sum(_samme_proba(estimator, n_classes, X)
+                            for estimator in self.estimators_)
+            else:   # self.algorithm == "SAMME"
+                proba = sum(estimator.predict_proba(X) * w
+                            for estimator, w in zip(self.estimators_,
+                                                    self.estimator_weights_))
 
-        proba /= self.estimator_weights_.sum()
-        proba = np.exp((1. / (n_classes - 1)) * proba)
+            proba /= self.estimator_weights_.sum()
+            proba = np.exp((1. / (n_classes - 1)) * proba)
+
         normalizer = proba.sum(axis=1)[:, np.newaxis]
         normalizer[normalizer == 0.0] = 1.0
         proba /= normalizer
@@ -817,7 +952,11 @@ class AdaBoostClassifier(BaseWeightBoosting, ClassifierMixin):
             else:
                 proba += current_proba
 
-            real_proba = np.exp((1. / (n_classes - 1)) * (proba / norm))
+            if self.algorithm == 'M2':
+                real_proba = proba
+            else:
+                real_proba = np.exp((1. / (n_classes - 1)) * (proba / norm))
+
             normalizer = real_proba.sum(axis=1)[:, np.newaxis]
             normalizer[normalizer == 0.0] = 1.0
             real_proba /= normalizer
